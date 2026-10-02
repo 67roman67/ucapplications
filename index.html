@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>click anywhere to start</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  
+  @keyframes sc{from{transform:translateX(300px)}to{transform:translateX(-420px)}}
+</style>
+</head>
+<body>
+<div id="msg">  </div>
+<div id="warn">  </div>
+<div id="blocked"></div>
+
+<script>
+"use strict";
+/* ===== CONFIG ===== */
+var USE_TABS = false;        // false (default): real browser WINDOWS that can bounce around. true: plain tabs (browsers never let a page move a tab).
+var ALLOW_FAKE = false;      // true: when popups are blocked, fill in with in-page fake windows. Default off: real windows only.
+var SPAWN_MS = 120;          // popup spawn interval
+var MAX_POPUPS = Infinity;   // no cap, per the brief. Set a number here to be gentler.
+var FALLBACK_CAP = 60;       // in-page fake windows are recycled beyond this
+
+/* ===== STATE ===== */
+var running = false, spawner = null, raf = 0, n = 0, seq = null;
+var wins = [];     // {w, x, y, vx, vy} real popups
+var fakes = [];    // {el, x, y, vx, vy} fallback windows
+var fallback = false;
+var actx = null, master = null;
+var $msg = document.getElementById("msg"), $blocked = document.getElementById("blocked");
+
+/* ===== POPUP PAGE (written into each popup; kept tiny) ===== */
+// Note: the opener writes this HTML into an about:blank popup, so it is same-origin and needs no extra file.
+var POPUP_HTML = '<!DOCTYPE html><title>YOU ARE AN IDIOT!</title>' +
+ '<body style="margin:0;overflow:hidden;background:#000"><canvas id=c style="display:block"></canvas><script>' +
+ 'var c=document.getElementById("c"),x=c.getContext("2d"),t=0,px=150,py=100,vx=4,vy=3,T="YOU ARE AN IDIOT!  ",cols=["#f0f","#0ff","#ff0","#0f0","#f00","#00f"],W,H,S,tw=1;' +
+ 'function rs(){W=c.width=innerWidth;H=c.height=innerHeight;S=Math.max(.5,Math.min(W,H)/300);x.font="bold "+(28*S|0)+"px Courier New";tw=x.measureText(T).width}rs();addEventListener("resize",rs);' + // fills the whole tab
+ 'function f(){t++;x.fillStyle=cols[(t/3|0)%6];x.fillRect(0,0,W,H);' +                  // flashing background
+ 'var r=45*S;px+=vx*S;py+=vy*S;if(px<r||px>W-r)vx=-vx;if(py<r||py>H-r)vy=-vy;' +        // bouncing smiley
+ 'x.save();x.translate(px,py);x.scale(S,S);x.fillStyle="#ffe000";x.strokeStyle="#000";x.lineWidth=4;x.beginPath();x.arc(0,0,40,0,6.3);x.fill();x.stroke();' +
+ 'x.fillStyle="#000";x.fillRect(-17,-15,8,12);x.fillRect(9,-15,8,12);x.beginPath();x.arc(0,4,22,.1,3.04);x.stroke();x.restore();' +
+ 'x.fillStyle=t%6<3?"#000":"#fff";x.font="bold "+(28*S|0)+"px Courier New";var o=(t*5*S)%tw;x.fillText(T,-o,H-15);x.fillText(T,tw-o,H-15);x.fillText(T,2*tw-o,H-15);' + // scrolling text
+ 'if(t%15===0)document.title=(t%30?"!!! IDIOT !!!":"YOU ARE AN IDIOT!");' +              // flashing tab title
+ 'requestAnimationFrame(f)}f();' +
+ // STOP KEY in tab: ask opener to run the global stop
+ 'addEventListener("keydown",function(e){if(e.key==="1"||e.code==="Digit1"||e.code==="Numpad1"){try{opener.__stopAll()}catch(_){close()}}});' +
+ // Orphan guard: close if opener is gone
+ 'setInterval(function(){try{if(!opener||opener.closed||!opener.__running)close()}catch(_){close()}},500);' +
+ '<\/script>';
+
+/* ===== POPUP SPAWNER ===== */
+// Real popups need a user gesture; first one is opened directly in the click handler.
+// moveTo/moveBy only work on windows opened by script, and Safari/mobile browsers restrict or ignore them.
+function spawnPopup(){
+  if (wins.length >= MAX_POPUPS) return null;
+  var W = screen.availWidth, H = screen.availHeight;
+  var x = Math.random() * Math.max(1, W - 300), y = Math.random() * Math.max(1, H - 300);
+  var w = null;
+  try { w = USE_TABS ? window.open("", "idiot" + (n++)) : window.open("", "idiot" + (n++), "popup=yes,width=300,height=300,left=" + (x|0) + ",top=" + (y|0) + ",menubar=no,toolbar=no,location=no,status=no,resizable=no"); } catch(e){}
+  if (!w) return null;
+  try { w.document.open(); w.document.write(POPUP_HTML); w.document.close(); } catch(e){}
+  wins.push({w: w, x: x, y: y, vx: (Math.random() < .5 ? -1 : 1) * (9 + Math.random() * 10), vy: (Math.random() < .5 ? -1 : 1) * (9 + Math.random() * 10)});
+  return w;
+}
+
+/* ===== FALLBACK: in-page floating windows (CSS-only animation) ===== */
+function spawnFake(){
+  var el;
+  if (fakes.length >= FALLBACK_CAP) { var old = fakes.shift(); el = old.el; }   // recycle oldest node
+  else { el = document.createElement("div"); el.className = "fw"; el.innerHTML = "<i></i><b>YOU ARE AN IDIOT! YOU ARE AN IDIOT!</b>"; document.body.appendChild(el); }
+  fakes.push({el: el, x: Math.random() * innerWidth, y: Math.random() * innerHeight, vx: (Math.random() < .5 ? -1 : 1) * (3 + Math.random() * 5), vy: (Math.random() < .5 ? -1 : 1) * (3 + Math.random() * 5)});
+}
+
+/* ===== MOVER: one shared loop for every window ===== */
+function tick(){
+  if (!running) return;
+  var W = screen.availWidth, H = screen.availHeight, i, o;
+  for (i = wins.length - 1; i >= 0; i--) {
+    o = wins[i];
+    if (o.w.closed) { wins.splice(i, 1); continue; }   // manually closed: drop it; spawner replaces it
+    if (USE_TABS) continue;                            // tabs can't be moved by script
+    o.x += o.vx; o.y += o.vy;
+    if (o.x < 0 || o.x > W - 300) { o.vx = -o.vx; o.x = Math.min(Math.max(o.x, 0), W - 300); }   // bounce off edges
+    if (o.y < 0 || o.y > H - 300) { o.vy = -o.vy; o.y = Math.min(Math.max(o.y, 0), H - 300); }
+    try { o.w.moveTo(o.x | 0, o.y | 0); } catch(e){}
+  }
+  for (i = 0; i < fakes.length; i++) {
+    o = fakes[i]; o.x += o.vx; o.y += o.vy;
+    if (o.x < 0 || o.x > innerWidth - 300) o.vx = -o.vx;
+    if (o.y < 0 || o.y > innerHeight - 300) o.vy = -o.vy;
+    o.el.style.transform = "translate(" + (o.x | 0) + "px," + (o.y | 0) + "px)";
+  }
+}
+
+/* ===== MUSIC SEQUENCER (Web Audio, original chiptune loop) ===== */
+var LEAD = [0,4,7,12, 7,4,7,9, 5,9,12,17, 12,9,12,14, 4,7,11,16, 11,7,11,12, 2,5,9,14, 9,5,7,0];
+var BASS = [-24,-24,-17,-24, -19,-19,-12,-19, -22,-22,-15,-22, -17,-17,-10,-17];
+function note(semi, t, dur, type, vol){
+  var o = actx.createOscillator(), g = actx.createGain();
+  o.type = type; o.frequency.value = 261.63 * Math.pow(2, semi / 12);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + dur + .02);
+  o.onended = function(){ try { g.disconnect(); } catch(e){} };
+}
+function startMusic(){
+  var Ctx = window.AudioContext || window.webkitAudioContext; if (!Ctx) return;
+  actx = new Ctx(); if (actx.resume) actx.resume();            // created/resumed inside the click handler
+  master = actx.createGain(); master.gain.value = 0.25; master.connect(actx.destination);
+  var step = 0;
+  seq = setInterval(function(){
+    var t = actx.currentTime + .02;
+    note(LEAD[step % LEAD.length], t, .11, "square", .5);
+    if (step % 2 === 0) note(BASS[(step / 2 | 0) % BASS.length], t, .2, "triangle", .8);
+    step++;
+  }, 125);
+}
+function stopMusic(){
+  clearInterval(seq); seq = null;
+  try { master.gain.value = 0; master.disconnect(); } catch(e){}
+  try { actx.close(); } catch(e){}
+  actx = master = null;
+}
+
+/* ===== START ===== */
+function start(){
+  if (running) return;
+  running = true; window.__running = true; fallback = false; $blocked.textContent = "";
+  document.body.classList.add("go");
+  $msg.textContent = "YOU ARE AN IDIOT!";
+  try { startMusic(); } catch(e){}
+  var first = spawnPopup();                       // directly inside the click handler
+  if (!first) {                                   // blocked: tell the user
+    fallback = ALLOW_FAKE;
+    $blocked.textContent = "Your browser blocked the popups. Allow popups for this site, then click again.";
+  }
+  // Browsers usually allow only ONE popup per click (the click's "user activation" is consumed).
+  // So every tick tries a real popup; whenever the browser refuses, an in-page window fills in so the chaos continues.
+  // The tick comes from a Web Worker (built from a Blob, no network) because background tabs throttle normal timers.
+  // The worker beats every 16ms and drives BOTH the mover and the spawner (rAF would pause when other windows cover this tab).
+  var last = Date.now();
+  spawner = new Worker(URL.createObjectURL(new Blob(["setInterval(function(){postMessage(0)},16)"])));
+  spawner.onmessage = function(){
+    if (!running) return;
+    tick();                                         // move every real window
+    if (Date.now() - last < SPAWN_MS) return;
+    last = Date.now();
+    if (!spawnPopup()) {                            // browser refused a popup
+      if (ALLOW_FAKE) spawnFake();
+      $blocked.textContent = "Your browser blocked the popups. Allow popups for this site, then click again.";
+    }
+  };
+}
+
+/* ===== STOP SWITCH ===== */
+function stopAll(){
+  if (!running) return;
+  running = false; window.__running = false;
+  try { spawner.terminate(); } catch(e){} spawner = null;        // 1. halt spawning (cheapest, first)
+  cancelAnimationFrame(raf);
+  stopMusic();                                   // 2. silence audio
+  var list = wins; wins = [];                    // 3. close every popup, in batches so the UI stays responsive
+  (function closeBatch(){
+    for (var i = 0; i < 25 && list.length; i++) { try { list.pop().w.close(); } catch(e){} }
+    if (list.length) setTimeout(closeBatch, 0);
+  })();
+  fakes.forEach(function(f){ f.el.remove(); }); fakes = [];
+  document.body.classList.remove("go");
+  $msg.textContent = "Stopped. Click anywhere to start again.";
+  $blocked.textContent = "";
+}
+window.__stopAll = stopAll;
+
+/* ===== EVENTS ===== */
+// While running, every extra click is a fresh user gesture, so it can open another real popup even if timers can't.
+document.addEventListener("click", function(){ running ? spawnPopup() : start(); });
+addEventListener("keydown", function(e){ if (e.key === "1" || e.code === "Digit1" || e.code === "Numpad1") stopAll(); });
+addEventListener("pagehide", stopAll);          // reload/navigate/close: also close popups (they poll too)
+</script>
+</body>
+</html>
